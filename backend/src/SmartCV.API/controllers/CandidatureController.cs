@@ -1,0 +1,167 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using API.data;
+using API.models;
+using API.models.Enums;
+using System.Security.Claims;
+using API.dtos.Candidature;
+
+namespace API.Controllers;
+
+[ApiController]
+[Route("api/candidatures")]
+[Authorize]
+public class CandidatureController : ControllerBase
+{
+    private readonly ApplicationDbContext _db;
+
+    public CandidatureController(ApplicationDbContext db)
+    {
+        _db = db;
+    }
+    
+
+    private int GetUserId()
+    {
+        // On vérifie "email" et ClaimTypes.Email pour être sûr de récupérer l'information
+        var email = User.FindFirst("email")?.Value ?? User.FindFirst(ClaimTypes.Email)?.Value;
+        if (string.IsNullOrEmpty(email))
+            throw new UnauthorizedAccessException("Email manquant dans le token");
+
+        var user = _db.Users.FirstOrDefault(u => u.Email == email);
+        if (user == null)
+            throw new UnauthorizedAccessException($"Utilisateur introuvable pour l'email: {email}");
+
+        return user.Id;
+    }
+
+
+    [HttpGet]
+    public async Task<IActionResult> GetMesCandidatures()
+    {
+        var userId = GetUserId();
+        var list = await _db.Candidatures
+            .Where(c => c.UserId == userId)
+            .OrderByDescending(c => c.DateEnvoi)
+            .Select(c => new {
+                c.Id,
+                c.Entreprise,
+                c.Poste,
+                c.DateEnvoi,
+                Statut = c.Statut.ToString(),
+                c.Notes
+            })
+            .ToListAsync();
+
+        return Ok(list);
+    }
+
+    [HttpPost]
+    public async Task<IActionResult> Ajouter([FromBody] CandidatureAjoutDto dto)
+    {
+        var userId = GetUserId();
+        var entreprise = dto.Entreprise.Trim();
+        var poste = dto.Poste.Trim();
+
+        var dejaPresente = await _db.Candidatures.AnyAsync(c =>
+            c.UserId == userId
+            && c.Entreprise.ToLower() == entreprise.ToLower()
+            && c.Poste.ToLower() == poste.ToLower());
+
+        if (dejaPresente)
+        {
+            return Conflict(new
+            {
+                message = "Cette candidature existe déjà pour cette entreprise et ce poste.",
+            });
+        }
+
+        var nouvelle = new Candidature
+        {
+            UserId = userId,
+            Entreprise = entreprise,
+            Poste = poste,
+            DateEnvoi = dto.DateEnvoi,
+            Statut = StatutCandidature.enregistree,
+            Notes = dto.Notes
+        };
+
+        _db.Candidatures.Add(nouvelle);
+        await _db.SaveChangesAsync();
+
+        return Ok(new { id = nouvelle.Id, message = "Candidature ajoutée" });
+    }
+
+    [HttpPut("{id}/statut")]
+    public async Task<IActionResult> ChangerStatut(int id, [FromBody] StatutDto dto)
+    {
+        var userId = GetUserId();
+        var candidature = await _db.Candidatures
+            .FirstOrDefaultAsync(c => c.Id == id && c.UserId == userId);
+
+        if (candidature == null)
+            return NotFound(new { message = "Candidature non trouvée" });
+
+        // Convertir le texte reçu en enum
+        candidature.Statut = StatutCandidatureConverter.ParseInput(dto.Statut);
+        await _db.SaveChangesAsync();
+
+        return Ok(new { message = $"Statut mis à jour : {dto.Statut}" });
+    }
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Supprimer(int id)
+    {
+        var userId = GetUserId();
+        var candidature = await _db.Candidatures
+            .FirstOrDefaultAsync(c => c.Id == id && c.UserId == userId);
+
+        if (candidature == null)
+            return NotFound(new { message = "Candidature non trouvée" });
+
+        _db.Candidatures.Remove(candidature);
+        await _db.SaveChangesAsync();
+
+        return Ok(new { message = "Candidature supprimée" });
+    }
+    [HttpGet("stats")]
+    public async Task<IActionResult> GetStats()
+    {
+        var userId = GetUserId();
+        var candidatures = await _db.Candidatures
+            .Where(c => c.UserId == userId)
+            .ToListAsync();
+
+        var total = candidatures.Count;
+        var nonArchivees = candidatures.Count(c => c.Statut != StatutCandidature.archivee);
+        var acceptees = candidatures.Count(c => c.Statut == StatutCandidature.acceptee);
+        var refusees = candidatures.Count(c => c.Statut == StatutCandidature.refusee);
+        var enCours = candidatures.Count(c => 
+            c.Statut != StatutCandidature.acceptee && 
+            c.Statut != StatutCandidature.refusee && 
+            c.Statut != StatutCandidature.archivee);
+
+        var stats = new
+        {
+            total = total,
+            actives = nonArchivees,
+            acceptees = acceptees,
+            refusees = refusees,
+            enCours = enCours,
+            tauxAcceptation = total > 0 ? Math.Round((double)acceptees / total * 100, 1) : 0,
+            parStatut = new
+            {
+                enregistree = candidatures.Count(c => c.Statut == StatutCandidature.enregistree),
+                envoyee = candidatures.Count(c => c.Statut == StatutCandidature.envoyee),
+                recue = candidatures.Count(c => c.Statut == StatutCandidature.recue),
+                enCoursExamen = candidatures.Count(c => c.Statut == StatutCandidature.en_cours_d_examen),
+                entretien = candidatures.Count(c => c.Statut == StatutCandidature.entretien),
+                acceptee = acceptees,
+                refusee = refusees,
+                archivee = candidatures.Count(c => c.Statut == StatutCandidature.archivee)
+            }
+        };
+
+        return Ok(stats);
+    }
+}
